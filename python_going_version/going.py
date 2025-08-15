@@ -5,19 +5,24 @@ Enhanced TCP Connection Monitor
 - Shows both IPv4 and IPv6 connections
 - Clean tabular output with dynamic column widths
 - Supports real-time monitoring, process information, filtering, permissions handling, and colorized output
+- Added JSON output, subnet filtering, sorting, and signal handling
 """
 
 import argparse
+import json
 import logging
 import os
+import platform
 import re
+import signal
 import time
 import glob
 from typing import List, NamedTuple
 from colorama import Fore, init
+import ipaddress
 
 # Initialize colorama for colored output
-init()
+init(autoreset=True)
 
 # Configure logging
 logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
@@ -28,7 +33,7 @@ class Socket(NamedTuple):
     remote_ip: str
     remote_port: int
     state: str
-    process: str  # New field for process name and PID
+    process: str  # Process name and PID
 
 TCP_STATES = {
     1: "ESTABLISHED",
@@ -60,19 +65,19 @@ STATE_COLORS = {
     "NEW_SYN_RECV": Fore.CYAN
 }
 
+# Cache for process name lookups
+PROCESS_CACHE = {}
+
 def parse_hex_ip_port(hex_str: str) -> tuple[str, int]:
     """Parse IP:port from hex format (e.g., '0100007F:0016' or '20010DB8...:1F90')"""
     try:
         ip_part, port_part = hex_str.split(':')
         ip_bytes = bytes.fromhex(ip_part)
         
-        # IPv4 (4 bytes)
         if len(ip_bytes) == 4:
-            ip = '.'.join(str(b) for b in reversed(ip_bytes))
-        # IPv6 (16 bytes)
+            ip = str(ipaddress.IPv4Address(ip_bytes[::-1]))
         elif len(ip_bytes) == 16:
-            ip = ':'.join(f"{(ip_bytes[i] << 8) + ip_bytes[i+1]:04x}"
-                         for i in range(0, 16, 2))
+            ip = str(ipaddress.IPv6Address(ip_bytes))
         else:
             raise ValueError(f"Invalid IP length: {len(ip_bytes)}")
         
@@ -82,15 +87,21 @@ def parse_hex_ip_port(hex_str: str) -> tuple[str, int]:
         raise ValueError(f"Invalid format: {hex_str}, error: {e}")
 
 def get_process_name(inode: str) -> str:
-    """Find process name and PID by matching socket inode"""
+    """Find process name and PID by matching socket inode, using cache"""
+    if inode in PROCESS_CACHE:
+        return PROCESS_CACHE[inode]
+    
     for pid_dir in glob.glob("/proc/[0-9]*/fd/*"):
         try:
             if os.path.islink(pid_dir) and os.readlink(pid_dir).endswith(f"socket:[{inode}]"):
                 pid = pid_dir.split("/")[2]
                 with open(f"/proc/{pid}/comm", "r") as f:
-                    return f"{f.read().strip()} ({pid})"
+                    process_name = f"{f.read().strip()} ({pid})"
+                    PROCESS_CACHE[inode] = process_name
+                    return process_name
         except (IOError, OSError):
             continue
+    PROCESS_CACHE[inode] = "Unknown"
     return "Unknown"
 
 def read_tcp_connections(file_path: str) -> List[Socket]:
@@ -111,7 +122,7 @@ def read_tcp_connections(file_path: str) -> List[Socket]:
                 return sockets
             for line in f:
                 fields = re.split(r'\s+', line.strip())
-                if len(fields) < 10:  # Need inode field (index 9)
+                if len(fields) < 10:
                     logging.warning(f"Skipping malformed line: {line.strip()}")
                     continue
                 
@@ -119,7 +130,7 @@ def read_tcp_connections(file_path: str) -> List[Socket]:
                     local = parse_hex_ip_port(fields[1])
                     remote = parse_hex_ip_port(fields[2])
                     state_code = int(fields[3], 16)
-                    inode = fields[9]  # Inode field for process mapping
+                    inode = fields[9]
                     
                     state = TCP_STATES.get(state_code, f"UNKNOWN({state_code})")
                     if state.startswith("UNKNOWN"):
@@ -144,28 +155,69 @@ def read_tcp_connections(file_path: str) -> List[Socket]:
         logging.error(f"Error reading {file_path}: {e}")
         return []
 
+def check_permissions(file_paths: List[str]) -> None:
+    """Check if the script has read access to the specified files"""
+    if os.geteuid() != 0:
+        for path in file_paths:
+            if not os.access(path, os.R_OK):
+                logging.error(f"Need root privileges to read {path}. Run with sudo.")
+                exit(1)
+
 def filter_sockets(sockets: List[Socket], args) -> List[Socket]:
     """Filter sockets based on command-line arguments"""
     filtered = sockets
     if args.state:
-        filtered = [s for s in filtered if s.state == args.state.upper()]
+        state = args.state.upper()
+        if state not in TCP_STATES.values():
+            logging.warning(f"Invalid state: {args.state}. Valid states: {', '.join(TCP_STATES.values())}")
+        filtered = [s for s in filtered if s.state == state]
     if args.local_ip:
-        filtered = [s for s in filtered if s.local_ip == args.local_ip]
+        try:
+            local_net = ipaddress.ip_network(args.local_ip, strict=False)
+            filtered = [s for s in filtered if ipaddress.ip_address(s.local_ip) in local_net]
+        except ValueError as e:
+            logging.error(f"Invalid local IP/network: {args.local_ip}, error: {e}")
+            return []
     if args.remote_ip:
-        filtered = [s for s in filtered if s.remote_ip == args.remote_ip]
+        try:
+            remote_net = ipaddress.ip_network(args.remote_ip, strict=False)
+            filtered = [s for s in filtered if ipaddress.ip_address(s.remote_ip) in remote_net]
+        except ValueError as e:
+            logging.error(f"Invalid remote IP/network: {args.remote_ip}, error: {e}")
+            return []
     if args.port:
         filtered = [s for s in filtered if s.local_port == args.port or s.remote_port == args.port]
+    if args.process:
+        filtered = [s for s in filtered if args.process.lower() in s.process.lower()]
     return filtered
 
-def display_connections(sockets: List[Socket]) -> None:
-    """Print connections in formatted table with dynamic column widths and colors"""
+def sort_sockets(sockets: List[Socket], sort_by: str) -> List[Socket]:
+    """Sort sockets by the specified field"""
+    if sort_by == "state":
+        return sorted(sockets, key=lambda s: s.state)
+    elif sort_by == "local_ip":
+        return sorted(sockets, key=lambda s: ipaddress.ip_address(s.local_ip))
+    elif sort_by == "remote_ip":
+        return sorted(sockets, key=lambda s: ipaddress.ip_address(s.remote_ip))
+    elif sort_by == "port":
+        return sorted(sockets, key=lambda s: (s.local_port, s.remote_port))
+    elif sort_by == "process":
+        return sorted(sockets, key=lambda s: s.process)
+    return sockets
+
+def display_connections(sockets: List[Socket], output_format: str = "table", no_color: bool = False) -> None:
+    """Display connections in the specified format"""
     if not sockets:
         print("No active TCP connections found")
         return
     
+    if output_format == "json":
+        print(json.dumps([s._asdict() for s in sockets], indent=2))
+        return
+    
     # Calculate maximum lengths for dynamic column widths
-    max_addr_len = 25  # Minimum width
-    max_process_len = 15  # Minimum width for process column
+    max_addr_len = 25
+    max_process_len = 15
     for s in sockets:
         local_addr = f"{s.local_ip}:{s.local_port}"
         remote_addr = f"{s.remote_ip}:{s.remote_port}"
@@ -174,27 +226,57 @@ def display_connections(sockets: List[Socket]) -> None:
     
     # Print header
     print("\nACTIVE TCP CONNECTIONS:")
-    print(f"{'State':<15} {'Local Address':<{max_addr_len}} {'Remote Address':<{max_addr_len}} {'Process':<{max_process_len}}")
-    print("-" * (15 + max_addr_len * 2 + max_process_len + 3))
+    header = f"{'State':<15} {'Local Address':<{max_addr_len}} {'Remote Address':<{max_addr_len}} {'Process':<{max_process_len}}"
+    print(header)
+    print("-" * len(header))
     
-    # Print each connection with colored state
+    # Print each connection
     for s in sockets:
         local_addr = f"{s.local_ip}:{s.local_port}"
         remote_addr = f"{s.remote_ip}:{s.remote_port}"
-        color = STATE_COLORS.get(s.state, Fore.WHITE)
-        print(f"{color}{s.state:<15}{Fore.RESET} {local_addr:<{max_addr_len}} {remote_addr:<{max_addr_len}} {s.process:<{max_process_len}}")
+        state = s.state if no_color else f"{STATE_COLORS.get(s.state, Fore.WHITE)}{s.state}{Fore.RESET}"
+        print(f"{state:<15} {local_addr:<{max_addr_len}} {remote_addr:<{max_addr_len}} {s.process:<{max_process_len}}")
+
+def handle_sigint(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print("\nStopped monitoring")
+    exit(0)
 
 def main():
+    # Check platform
+    if platform.system() != "Linux":
+        logging.error("This script requires Linux with /proc filesystem")
+        exit(1)
+    
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="TCP Connection Monitor")
+    parser = argparse.ArgumentParser(
+        description="TCP Connection Monitor",
+        epilog=f"Valid states: {', '.join(TCP_STATES.values())}\nExample: sudo python3 tcp_monitor.py --watch 1 --state ESTABLISHED --local-ip 192.168.1.0/24"
+    )
     parser.add_argument("--tcp-file", default="/proc/net/tcp", help="Path to TCP file")
     parser.add_argument("--tcp6-file", default="/proc/net/tcp6", help="Path to TCP6 file")
     parser.add_argument("--watch", type=float, default=0, help="Refresh interval in seconds (0 for single snapshot)")
-    parser.add_argument("--state", help="Filter by connection state (e.g., ESTABLISHED)")
-    parser.add_argument("--local-ip", help="Filter by local IP address")
-    parser.add_argument("--remote-ip", help="Filter by remote IP address")
+    parser.add_argument("--state", help="Filter by connection state")
+    parser.add_argument("--local-ip", help="Filter by local IP or subnet (e.g., 192.168.1.0/24)")
+    parser.add_argument("--remote-ip", help="Filter by remote IP or subnet")
     parser.add_argument("--port", type=int, help="Filter by local or remote port")
+    parser.add_argument("--process", help="Filter by process name or PID")
+    parser.add_argument("--sort", choices=["state", "local_ip", "remote_ip", "port", "process"], default="state", help="Sort by field")
+    parser.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
+
+    # Set logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.INFO)
+
+    # Check permissions
+    check_permissions([args.tcp_file, args.tcp6_file])
+
+    # Set up signal handling for watch mode
+    if args.watch > 0:
+        signal.signal(signal.SIGINT, handle_sigint)
 
     # Read and display connections
     if args.watch > 0:
@@ -203,15 +285,17 @@ def main():
             for file_path in [args.tcp_file, args.tcp6_file]:
                 sockets.extend(read_tcp_connections(file_path))
             sockets = filter_sockets(sockets, args)
+            sockets = sort_sockets(sockets, args.sort)
             os.system('clear')
-            display_connections(sockets)
+            display_connections(sockets, args.format, args.no_color)
             time.sleep(args.watch)
     else:
         sockets = []
         for file_path in [args.tcp_file, args.tcp6_file]:
             sockets.extend(read_tcp_connections(file_path))
         sockets = filter_sockets(sockets, args)
-        display_connections(sockets)
+        sockets = sort_sockets(sockets, args.sort)
+        display_connections(sockets, args.format, args.no_color)
 
 if __name__ == "__main__":
     main()
