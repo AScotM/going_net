@@ -5,7 +5,7 @@
  * Parses /proc/net/tcp and /proc/net/tcp6 to show active IPv4 and IPv6 connections
  *
  * Only works on Linux systems with access to /proc.
- * Usage: php tcp_monitor.php [--json]
+ * Usage: php php_going.php [--json]
  */
 
 // Define constants if not already defined
